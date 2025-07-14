@@ -1,0 +1,8 @@
+#!/bin/sh
+
+generate_commit_message.py
+
+# If the script exits with an error, abort the commit
+if [ $? -ne 0 ]; then
+  exit 1
+fi

@@ -1,0 +1,130 @@
+#!/Users/kfir/.virtualenvs/ai-commit-env/bin/python
+
+import os
+import subprocess
+import sys
+import tempfile
+import google.generativeai as genai
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt, Confirm
+
+console = Console()
+
+def run_command(command):
+    """Executes a shell command and returns the output."""
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        console.print(f"[bold red]Error executing command:[/bold red] {command}\n{e.stderr.strip()}")
+        return ""
+
+def ensure_staged_changes():
+    """Ensures there are staged changes to commit."""
+    staged = run_command("git diff --cached")
+    if not staged:
+        console.print("[yellow]No staged changes detected. Staging all files...[/yellow]")
+        run_command("git add .")
+
+    if not run_command("git diff --cached"):
+        console.print("[bold yellow]No changes found to commit. Aborting.[/bold yellow]")
+        sys.exit(0)
+
+def get_staged_diff():
+    """Retrieves the staged git diff, truncated if necessary."""
+    raw_diff = run_command("git diff --cached --unified=0 --no-color")
+    max_chars = 12000
+    if len(raw_diff) > max_chars:
+        return raw_diff[:max_chars] + "\n... (diff truncated)"
+    return raw_diff
+
+def generate_commit_message(diff):
+    """Generates a commit message using the Gemini API."""
+    with console.status("[bold green]Calling Gemini to craft commit message...[/bold green]"):
+        try:
+            genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+            model = genai.GenerativeModel('gemini-2.5-flash-lite-preview-06-17')
+
+            prompt = [
+                "You are a senior software engineer who writes exemplary Conventional Commit messages.",
+                "Generate a commit message that follows this exact structure:",
+                "Line 1: <type>(<optional scope>): <short imperative subject> (max 72 chars)",
+                "Line 2: BLANK",
+                "Line 3+: A concise body describing *why* the change was made and what it does. Use a bullet list (hyphen prefix) if multiple points.",
+                "Keep each body line ≤ 80 chars. If no body is necessary, just return the subject line and a blank line.",
+                "Do NOT wrap the message in code fences or quotation marks.",
+                "\nHere is the git diff of the staged changes:\n\n",
+                diff,
+            ]
+
+            response = model.generate_content(" ".join(prompt))
+            return response.text.strip()
+        except Exception as e:
+            console.print(f"[bold red]Gemini API request failed:[/bold red]\n{e}")
+            sys.exit(1)
+
+def commit(message):
+    """Creates a commit with the given message."""
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix=".txt") as tmp:
+        tmp.write(message + "\n")
+        tmp_path = tmp.name
+
+    try:
+        run_command(f'git commit -a -F "{tmp_path}"')
+        console.print("\n[bold green]✔️ Commit created:[/bold green]")
+        console.print(Panel(message, title="Committed Message", border_style="cyan"))
+
+        current_branch = run_command("git rev-parse --abbrev-ref HEAD")
+        if Confirm.ask(f"\n[bold]Push to origin/{current_branch}?[/bold]"):
+             with console.status("[bold green]Pushing changes to remote...[/bold green]"):
+                push_output = run_command(f"git push origin {current_branch}")
+                console.print(f"[green]Successfully pushed to origin/{current_branch}.[/green]")
+    finally:
+        os.unlink(tmp_path)
+
+
+def main():
+    """Main function to run the AI commit process."""
+    if "GEMINI_API_KEY" not in os.environ:
+        console.print("[bold red]Error: GEMINI_API_KEY environment variable is not set.[/bold red]")
+        console.print("[yellow]Please get your key from Google AI Studio and set it.[/yellow]")
+        sys.exit(1)
+
+    console.print("[bold cyan]AI Commit Helper[/bold cyan]\n")
+    ensure_staged_changes()
+    diff = get_staged_diff()
+    message = generate_commit_message(diff)
+
+    while True:
+        console.print("\n[bold]Suggested commit message:[/bold]")
+        console.print(Panel(message, border_style="yellow"))
+
+        action = Prompt.ask(
+            "How would you like to proceed?",
+            choices=["✅ Use", "📝 Edit", "🔄 Regenerate", "❌ Abort"],
+            default="✅ Use"
+        )
+
+        if action.startswith("✅"):
+            commit(message)
+            break
+        elif action.startswith("📝"):
+            message = Prompt.ask("[bold]Edit the commit message[/bold]", default=message)
+            if message.strip():
+                commit(message)
+                break
+        elif action.startswith("🔄"):
+            message = generate_commit_message(diff)
+        elif action.startswith("❌"):
+            console.print("[bold red]\nAborted. No commit created.[/bold red]")
+            sys.exit(0)
+
+if __name__ == "__main__":
+    main()

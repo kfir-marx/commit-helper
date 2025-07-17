@@ -104,25 +104,34 @@ def main():
 
     while True:
         console.print("\n[bold]Suggested commit message:[/bold]")
-        console.print(Panel(message, border_style="yellow"))
+        console.print(Panel(message, border_style="yellow", expand=False))
 
-        action = Prompt.ask(
-            "How would you like to proceed?",
-            choices=["✅ Use", "📝 Edit", "🔄 Regenerate", "❌ Abort"],
-            default="✅ Use"
-        )
+        # --- MODIFICATION START ---
+        # Present options as a numbered list
+        console.print("\nHow would you like to proceed?")
+        console.print("[1] ✅ Use this message")
+        console.print("[2] 📝 Edit message")
+        console.print("[3] 🔄 Regenerate message")
+        console.print("[4] ❌ Abort")
 
-        if action.startswith("✅"):
+        # Prompt for a number
+        choice = Prompt.ask("Enter your choice", choices=["1", "2", "3", "4"], default="1")
+        # --- MODIFICATION END ---
+
+
+        if choice == "1": # Use
             commit(message)
             break
-        elif action.startswith("📝"):
-            message = Prompt.ask("[bold]Edit the commit message[/bold]", default=message)
-            if message.strip():
-                commit(message)
+        elif choice == "2": # Edit
+            edited_message = Prompt.ask("[bold]Edit the commit message[/bold]", default=message)
+            if edited_message.strip():
+                commit(edited_message)
                 break
-        elif action.startswith("🔄"):
+            else:
+                 console.print("[red]Commit message cannot be empty.[/red]")
+        elif choice == "3": # Regenerate
             message = generate_commit_message(diff)
-        elif action.startswith("❌"):
+        elif choice == "4": # Abort
             console.print("[bold red]\nAborted. No commit created.[/bold red]")
             sys.exit(0)
 

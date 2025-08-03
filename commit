@@ -50,7 +50,7 @@ def generate_commit_message(diff):
     with console.status("[bold green]Calling Gemini to craft commit message...[/bold green]"):
         try:
             genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-            model = genai.GenerativeModel('gemini-2.5-flash-lite-preview-06-17')
+            model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
             prompt = [
                 "You are a senior software engineer who writes exemplary Conventional Commit messages.",

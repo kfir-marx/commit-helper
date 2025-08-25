@@ -1,0 +1,161 @@
+#!/Users/kfir/.virtualenvs/ai-commit-env/bin/python
+
+import os
+import subprocess
+import sys
+import tempfile
+from openai import AzureOpenAI  
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt, Confirm
+
+console = Console()
+
+# --- AZURE OPENAI CLIENT INITIALIZATION ---
+# It's more efficient to initialize the client once
+try:
+    client = AzureOpenAI(
+        api_key=os.getenv("AZURE_OPENAI_KEY"),
+        api_version="2024-02-01",
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+    )
+    # Get the deployment name from an environment variable
+    AZURE_DEPLOYMENT_NAME = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
+except TypeError:
+    # This will be handled properly in the main() function check
+    client = None
+    AZURE_DEPLOYMENT_NAME = None
+# ---------------------------------------------
+
+
+def run_command(command):
+    """Executes a shell command and returns the output."""
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        console.print(f"[bold red]Error executing command:[/bold red] {command}\n{e.stderr.strip()}")
+        return ""
+
+def ensure_staged_changes():
+    """Ensures there are staged changes to commit."""
+    staged = run_command("git diff --cached")
+    if not staged:
+        console.print("[yellow]No staged changes detected. Staging all files...[/yellow]")
+        run_command("git add .")
+
+    if not run_command("git diff --cached"):
+        console.print("[bold yellow]No changes found to commit. Aborting.[/bold yellow]")
+        sys.exit(0)
+
+def get_staged_diff():
+    """Retrieves the staged git diff, truncated if necessary."""
+    raw_diff = run_command("git diff --cached --unified=0 --no-color")
+    max_chars = 12000
+    if len(raw_diff) > max_chars:
+        return raw_diff[:max_chars] + "\n... (diff truncated)"
+    return raw_diff
+
+def generate_commit_message(diff):
+    """Generates a commit message using the Azure OpenAI API.""" # <-- CHANGED
+    with console.status("[bold green]Calling Azure OpenAI to craft commit message...[/bold green]"): # <-- CHANGED
+        try:
+            system_prompt = (
+                "You are a senior software engineer who writes exemplary Conventional Commit messages."
+                "Generate a commit message that follows this exact structure:"
+                "Line 1: <type>(<optional scope>): <short imperative subject> (max 72 chars)"
+                "Line 2: BLANK"
+                "Line 3+: A concise body describing *why* the change was made and what it does. Use a bullet list (hyphen prefix) if multiple points."
+                "Keep each body line ≤ 80 chars. If no body is necessary, just return the subject line and a blank line."
+                "Do NOT wrap the message in code fences or quotation marks."
+            )
+            
+            user_prompt = f"Here is the git diff of the staged changes:\n\n{diff}"
+
+            response = client.chat.completions.create(
+                model=AZURE_DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.6,
+                max_tokens=150
+            )
+            
+            return response.choices[0].message.content.strip()
+        
+        except Exception as e:
+            console.print(f"[bold red]Azure OpenAI API request failed:[/bold red]\n{e}") # <-- CHANGED
+            sys.exit(1)
+
+def commit(message):
+    """Creates a commit with the given message."""
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix=".txt") as tmp:
+        tmp.write(message + "\n")
+        tmp_path = tmp.name
+
+    try:
+        run_command(f'git commit -a -F "{tmp_path}"')
+        console.print("\n[bold green]✔️ Commit created:[/bold green]")
+        console.print(Panel(message, title="Committed Message", border_style="cyan"))
+
+        current_branch = run_command("git rev-parse --abbrev-ref HEAD")
+        if Confirm.ask(f"\n[bold]Push to origin/{current_branch}?[/bold]"):
+             with console.status("[bold green]Pushing changes to remote...[/bold green]"):
+                push_output = run_command(f"git push origin {current_branch}")
+                console.print(f"[green]Successfully pushed to origin/{current_branch}.[/green]")
+    finally:
+        os.unlink(tmp_path)
+
+
+def main():
+    """Main function to run the AI commit process."""
+    required_vars = ["AZURE_OPENAI_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT_NAME"]
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        console.print(f"[bold red]Error: Missing required environment variables: {', '.join(missing_vars)}[/bold red]")
+        console.print("[yellow]Please set them in your environment. You can find these in the Azure Portal.[/yellow]")
+        sys.exit(1)
+
+    console.print("[bold cyan]AI Commit Helper[/bold cyan]\n")
+    ensure_staged_changes()
+    diff = get_staged_diff()
+    message = generate_commit_message(diff)
+
+    while True:
+        console.print("\n[bold]Suggested commit message:[/bold]")
+        console.print(Panel(message, border_style="yellow", expand=False))
+
+        console.print("\nHow would you like to proceed?")
+        console.print("[1] ✅ Use this message")
+        console.print("[2] 📝 Edit message")
+        console.print("[3] 🔄 Regenerate message")
+        console.print("[4] ❌ Abort")
+
+        choice = Prompt.ask("Enter your choice", choices=["1", "2", "3", "4"], default="1")
+
+        if choice == "1": # Use
+            commit(message)
+            break
+        elif choice == "2": # Edit
+            edited_message = Prompt.ask("[bold]Edit the commit message[/bold]", default=message)
+            if edited_message.strip():
+                commit(edited_message)
+                break
+            else:
+                 console.print("[red]Commit message cannot be empty.[/red]")
+        elif choice == "3": # Regenerate
+            message = generate_commit_message(diff)
+        elif choice == "4": # Abort
+            console.print("[bold red]\nAborted. No commit created.[/bold red]")
+            sys.exit(0)
+
+if __name__ == "__main__":
+    main()

@@ -70,7 +70,7 @@ def generate_commit_message(client, deployment_name, diff):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                max_completion_tokens=2000
+                max_completion_tokens=5000
             )
             
             return response.choices[0].message.content.strip()

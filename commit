@@ -48,7 +48,7 @@ def get_staged_diff():
 
 def generate_commit_message(client, deployment_name, diff):
     """Generates a commit message using the Azure OpenAI API."""
-    with console.status("[bold green]Calling Azure OpenAI (gpt-4o-mini)...[/bold green]"):
+    with console.status(f"[bold green]Calling Azure OpenAI ({deployment_name})...[/bold green]"):
         try:
             system_prompt = (
                 "You are a senior software engineer. Generate a Conventional Commit message based on the provided git diff."
@@ -70,15 +70,22 @@ def generate_commit_message(client, deployment_name, diff):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.7, 
-                max_tokens=200
+                max_completion_tokens=2000
             )
             
             return response.choices[0].message.content.strip()
         
         except Exception as e:
             console.print(f"[bold red]Azure OpenAI API request failed:[/bold red]")
-            console.print(str(e))
+            console.print(f"Error Message: {str(e)}")
+            
+            # --- Check for full API response body ---
+            if hasattr(e, 'body') and e.body is not None:
+                console.print("\n[bold yellow]--- Full API Response / Error Details ---[/bold yellow]")
+                # Rich will automatically pretty-print dictionaries
+                console.print(e.body)
+            # ----------------------------------------
+            
             sys.exit(1)
 
 def edit_message_in_editor(initial_message):

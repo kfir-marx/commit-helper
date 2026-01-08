@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
-import google.generativeai as genai
+from openai import AzureOpenAI
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
@@ -23,116 +23,166 @@ def run_command(command):
         )
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
-        console.print(f"[bold red]Error executing command:[/bold red] {command}\n{e.stderr.strip()}")
         return ""
 
-def ensure_staged_changes():
-    """Ensures there are staged changes to commit."""
-    staged = run_command("git diff --cached")
+def stage_all_changes():
+    """Stages all changes (tracked and untracked) automatically."""
+    console.print("[yellow]Staging all detected changes (git add .)...[/yellow]")
+    run_command("git add .")
+    
+    # Verify something is actually staged
+    staged = run_command("git diff --cached --name-only")
     if not staged:
-        console.print("[yellow]No staged changes detected. Staging all files...[/yellow]")
-        run_command("git add .")
-
-    if not run_command("git diff --cached"):
-        console.print("[bold yellow]No changes found to commit. Aborting.[/bold yellow]")
+        console.print("[bold red]No changes found to commit. Aborting.[/bold red]")
         sys.exit(0)
 
 def get_staged_diff():
     """Retrieves the staged git diff, truncated if necessary."""
-    raw_diff = run_command("git diff --cached --unified=0 --no-color")
-    max_chars = 12000
+    # --unified=1 gives a bit of context for the AI
+    raw_diff = run_command("git diff --cached --unified=1 --no-color")
+    
+    max_chars = 15000 
     if len(raw_diff) > max_chars:
         return raw_diff[:max_chars] + "\n... (diff truncated)"
     return raw_diff
 
-def generate_commit_message(diff):
-    """Generates a commit message using the Gemini API."""
-    with console.status("[bold green]Calling Gemini to craft commit message...[/bold green]"):
+def generate_commit_message(client, deployment_name, diff):
+    """Generates a commit message using the Azure OpenAI API."""
+    with console.status("[bold green]Calling Azure OpenAI (gpt-4o-mini)...[/bold green]"):
         try:
-            genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-            model = genai.GenerativeModel('gemini-2.5-flash-lite')
+            system_prompt = (
+                "You are a senior software engineer. Generate a Conventional Commit message based on the provided git diff."
+                "\nStructure:"
+                "\n1. <type>(<scope>): <subject> (Max 50 chars, imperative mood)"
+                "\n2. <BLANK LINE>"
+                "\n3. Body: Bullet points (-) explaining *why* and *what* changed. Wrap lines at 72 chars."
+                "\n\nRules:"
+                "\n- Use types: feat, fix, docs, style, refactor, test, chore."
+                "\n- Do NOT include 'Here is the commit message' or code blocks."
+                "\n- Just return the raw commit message text."
+            )
+            
+            user_prompt = f"Git Diff to analyze:\n\n{diff}"
 
-            prompt = [
-                "You are a senior software engineer who writes exemplary Conventional Commit messages.",
-                "Generate a commit message that follows this exact structure:",
-                "Line 1: <type>(<optional scope>): <short imperative subject> (max 72 chars)",
-                "Line 2: BLANK",
-                "Line 3+: A concise body describing *why* the change was made and what it does. Use a bullet list (hyphen prefix) if multiple points.",
-                "Keep each body line ≤ 80 chars. If no body is necessary, just return the subject line and a blank line.",
-                "Do NOT wrap the message in code fences or quotation marks.",
-                "\nHere is the git diff of the staged changes:\n\n",
-                diff,
-            ]
-
-            response = model.generate_content(" ".join(prompt))
-            return response.text.strip()
+            response = client.chat.completions.create(
+                model=deployment_name, 
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.7, 
+                max_tokens=200
+            )
+            
+            return response.choices[0].message.content.strip()
+        
         except Exception as e:
-            console.print(f"[bold red]Gemini API request failed:[/bold red]\n{e}")
+            console.print(f"[bold red]Azure OpenAI API request failed:[/bold red]")
+            console.print(str(e))
             sys.exit(1)
+
+def edit_message_in_editor(initial_message):
+    """Opens the default editor with the message pre-filled for editing."""
+    editor = os.environ.get('EDITOR', 'vim') # Defaults to vim if $EDITOR is not set
+    
+    with tempfile.NamedTemporaryFile(suffix=".txt", mode='w+', delete=False) as tf:
+        tf.write(initial_message)
+        tf_path = tf.name
+
+    try:
+        # Open the editor
+        subprocess.call([editor, tf_path])
+        
+        # Read the file back after the user closes the editor
+        with open(tf_path, 'r') as tf:
+            edited_message = tf.read().strip()
+            
+        return edited_message
+    finally:
+        if os.path.exists(tf_path):
+            os.unlink(tf_path)
 
 def commit(message):
     """Creates a commit with the given message."""
     with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix=".txt") as tmp:
-        tmp.write(message + "\n")
+        tmp.write(message)
         tmp_path = tmp.name
 
     try:
-        run_command(f'git commit -a -F "{tmp_path}"')
-        console.print("\n[bold green]✔️ Commit created:[/bold green]")
+        # We use standard 'git commit' because we already ran 'git add .' at the start
+        run_command(f'git commit -F "{tmp_path}"')
+        
+        console.print("\n[bold green]✔️  Commit created successfully![/bold green]")
         console.print(Panel(message, title="Committed Message", border_style="cyan"))
 
         current_branch = run_command("git rev-parse --abbrev-ref HEAD")
         if Confirm.ask(f"\n[bold]Push to origin/{current_branch}?[/bold]"):
-             with console.status("[bold green]Pushing changes to remote...[/bold green]"):
+             with console.status(f"[bold green]Pushing to origin/{current_branch}...[/bold green]"):
                 push_output = run_command(f"git push origin {current_branch}")
                 console.print(f"[green]Successfully pushed to origin/{current_branch}.[/green]")
+    except Exception as e:
+        console.print(f"[bold red]Error during commit/push:[/bold red] {e}")
     finally:
-        os.unlink(tmp_path)
-
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 def main():
     """Main function to run the AI commit process."""
-    if "GEMINI_API_KEY" not in os.environ:
-        console.print("[bold red]Error: GEMINI_API_KEY environment variable is not set.[/bold red]")
-        console.print("[yellow]Please get your key from Google AI Studio and set it.[/yellow]")
+    console.print("[bold cyan]AI Commit Helper (Azure Edition)[/bold cyan]\n")
+
+    # 1. Load Environment Variables
+    AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+    AZURE_KEY = os.getenv("AZURE_OPENAI_KEY")
+    AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+
+    if not all([AZURE_ENDPOINT, AZURE_KEY, AZURE_DEPLOYMENT]):
+        console.print(f"[bold red]Error: Missing environment variables (ENDPOINT, KEY, or DEPLOYMENT_NAME)[/bold red]")
         sys.exit(1)
 
-    console.print("[bold cyan]AI Commit Helper[/bold cyan]\n")
-    ensure_staged_changes()
+    # 2. Initialize Azure Client
+    try:
+        client = AzureOpenAI(
+            api_key=AZURE_KEY,
+            api_version="2024-10-21",
+            azure_endpoint=AZURE_ENDPOINT
+        )
+    except Exception as e:
+        console.print(f"[bold red]Failed to initialize Azure Client:[/bold red] {e}")
+        sys.exit(1)
+
+    # 3. Stage & Diff
+    stage_all_changes() # <-- Changed to auto-stage everything
     diff = get_staged_diff()
-    message = generate_commit_message(diff)
+    
+    # 4. Generate Message
+    message = generate_commit_message(client, AZURE_DEPLOYMENT, diff)
 
     while True:
         console.print("\n[bold]Suggested commit message:[/bold]")
         console.print(Panel(message, border_style="yellow", expand=False))
 
-        # --- MODIFICATION START ---
-        # Present options as a numbered list
-        console.print("\nHow would you like to proceed?")
-        console.print("[1] ✅ Use this message")
-        console.print("[2] 📝 Edit message")
+        console.print("\n[1] ✅ Use this message")
+        console.print("[2] 📝 Edit message (opens editor)")
         console.print("[3] 🔄 Regenerate message")
         console.print("[4] ❌ Abort")
 
-        # Prompt for a number
-        choice = Prompt.ask("Enter your choice", choices=["1", "2", "3", "4"], default="1")
-        # --- MODIFICATION END ---
-
+        choice = Prompt.ask("Choice", choices=["1", "2", "3", "4"], default="1")
 
         if choice == "1": # Use
             commit(message)
             break
         elif choice == "2": # Edit
-            edited_message = Prompt.ask("[bold]Edit the commit message[/bold]", default=message)
-            if edited_message.strip():
-                commit(edited_message)
-                break
+            # Opens Vim/Nano/VSCode with the text pre-filled
+            edited_message = edit_message_in_editor(message)
+            if edited_message:
+                message = edited_message # Update current message and loop back to confirmation
+                # Loop continues, showing the new message for confirmation
             else:
-                 console.print("[red]Commit message cannot be empty.[/red]")
+                 console.print("[red]Message was cleared. Keeping original suggestion.[/red]")
         elif choice == "3": # Regenerate
-            message = generate_commit_message(diff)
+            message = generate_commit_message(client, AZURE_DEPLOYMENT, diff)
         elif choice == "4": # Abort
-            console.print("[bold red]\nAborted. No commit created.[/bold red]")
+            console.print("[bold red]Aborted.[/bold red]")
             sys.exit(0)
 
 if __name__ == "__main__":
